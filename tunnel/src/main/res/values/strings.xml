@@ -1,0 +1,9 @@
+<resources>
+    <string name="awg_vpn_notification_channel_name">VPN connection</string>
+    <string name="awg_vpn_notification_channel_description">Shows the VPN connection state while the tunnel is active.</string>
+    <string name="awg_vpn_notification_title">BroVPN</string>
+    <string name="awg_vpn_notification_starting">Starting VPN…</string>
+    <string name="awg_vpn_notification_connecting">Connecting to VPN…</string>
+    <string name="awg_vpn_notification_connected">VPN connected</string>
+    <string name="awg_vpn_notification_stopping">Disconnecting VPN…</string>
+</resources>

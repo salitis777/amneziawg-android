@@ -1,0 +1,9 @@
+<resources>
+    <string name="awg_vpn_notification_channel_name">VPN-подключение</string>
+    <string name="awg_vpn_notification_channel_description">Показывает состояние VPN, пока туннель активен.</string>
+    <string name="awg_vpn_notification_title">BroVPN</string>
+    <string name="awg_vpn_notification_starting">Запуск VPN…</string>
+    <string name="awg_vpn_notification_connecting">Подключение к VPN…</string>
+    <string name="awg_vpn_notification_connected">VPN подключён</string>
+    <string name="awg_vpn_notification_stopping">Отключение VPN…</string>
+</resources>

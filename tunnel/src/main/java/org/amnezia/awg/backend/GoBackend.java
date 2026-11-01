@@ -5,8 +5,13 @@
 
 package org.amnezia.awg.backend;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.system.OsConstants;
@@ -22,6 +27,7 @@ import org.amnezia.awg.config.Peer;
 import org.amnezia.awg.crypto.Key;
 import org.amnezia.awg.crypto.KeyFormatException;
 import org.amnezia.awg.util.NonNullForAll;
+import org.amnezia.awg.tunnel.R;
 
 import java.net.InetAddress;
 import java.util.Collections;
@@ -49,10 +55,11 @@ public final class GoBackend implements Backend {
     private static GhettoCompletableFuture<VpnService> vpnService = new GhettoCompletableFuture<>();
     private final Context context;
     @Nullable private Config currentConfig;
-    @Nullable private Tunnel currentTunnel;
-    private int currentTunnelHandle = -1;
+    @Nullable private volatile Tunnel currentTunnel;
+    private volatile int currentTunnelHandle = -1;
     @Nullable private Thread statusThread;
     @Nullable private StatusCallback statusCallback;
+    @Nullable private volatile VpnService vpnServiceInstance;
 
     /**
      * Public constructor for GoBackend.
@@ -218,10 +225,15 @@ public final class GoBackend implements Backend {
      */
     private void launchStatusJob() {
         stopStatusJob();
+        final Tunnel tunnel = currentTunnel;
+        if (tunnel == null) {
+            Log.w(TAG, "Cannot launch status job without an active tunnel");
+            return;
+        }
         Log.d(TAG, "Launch status job");
         statusThread = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted()) {
-                final long lastHandshake = getLastHandshake(currentTunnel);
+                final long lastHandshake = getLastHandshake(tunnel);
 
                 // Check if tunnel is no longer active (race condition protection)
                 if (lastHandshake == -3L) {
@@ -244,6 +256,11 @@ public final class GoBackend implements Backend {
                 // -1 may be returned if unable to parse output (doesn't mean no connection)
                 // -2 indicates command execution error (also doesn't mean no connection)
                 if (lastHandshake > 0L) {
+                    if (currentTunnel != tunnel || currentTunnelHandle == -1)
+                        break;
+                    final VpnService service = vpnServiceInstance;
+                    if (service != null)
+                        service.onHandshakeEstablished();
                     if (statusCallback != null) {
                         statusCallback.onStatusChanged(true);
                     }
@@ -311,12 +328,22 @@ public final class GoBackend implements Backend {
             } catch (final Exception e) {
                 if (originalTunnel != null)
                     setStateInternal(originalTunnel, originalConfig, State.UP);
+                else
+                    stopVpnServiceAfterFailedStart();
                 throw e;
             }
         } else if (state == State.DOWN && tunnel == currentTunnel) {
             setStateInternal(tunnel, null, State.DOWN);
         }
         return getState(tunnel);
+    }
+
+    private void stopVpnServiceAfterFailedStart() {
+        final VpnService service = vpnServiceInstance;
+        if (service != null && currentTunnel == null) {
+            service.stopForegroundAndNotification();
+            service.stopSelf();
+        }
     }
 
     private void setStateInternal(final Tunnel tunnel, @Nullable final Config config, final State state)
@@ -435,15 +462,23 @@ public final class GoBackend implements Backend {
                 Log.w(TAG, "Tunnel already down");
                 return;
             }
+            final VpnService service = vpnServiceInstance;
+            if (service != null)
+                service.updateNotification(VpnNotificationState.STOPPING);
             stopStatusJob();
             int handleToClose = currentTunnelHandle;
             currentTunnel = null;
             currentTunnelHandle = -1;
             currentConfig = null;
             awgTurnOff(handleToClose);
-            try {
-                vpnService.get(0, TimeUnit.NANOSECONDS).stopSelf();
-            } catch (final TimeoutException ignored) { }
+            if (service != null) {
+                service.stopForegroundAndNotification();
+                service.stopSelf();
+            } else {
+                try {
+                    vpnService.get(0, TimeUnit.NANOSECONDS).stopSelf();
+                } catch (final TimeoutException ignored) { }
+            }
         }
 
         tunnel.onStateChange(state);
@@ -490,21 +525,103 @@ public final class GoBackend implements Backend {
      * {@link android.net.VpnService} implementation for {@link GoBackend}
      */
     public static class VpnService extends android.net.VpnService {
+        private static final String NOTIFICATION_CHANNEL_ID = "amneziawg_vpn";
+        private static final int NOTIFICATION_ID = 49021;
+
         @Nullable private GoBackend owner;
+        private boolean foregroundStarted;
+        private volatile boolean destroyed;
+        private volatile VpnNotificationState notificationState = VpnNotificationState.STARTING;
 
         public Builder getBuilder() {
             return new Builder();
         }
 
+        private void createNotificationChannel() {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O)
+                return;
+            final NotificationChannel channel = new NotificationChannel(
+                    NOTIFICATION_CHANNEL_ID,
+                    getString(R.string.awg_vpn_notification_channel_name),
+                    NotificationManager.IMPORTANCE_LOW);
+            channel.setDescription(getString(R.string.awg_vpn_notification_channel_description));
+            channel.setShowBadge(false);
+            final NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (manager != null)
+                manager.createNotificationChannel(channel);
+        }
+
+        private Notification buildNotification() {
+            final int icon = android.R.drawable.ic_lock_lock;
+            final Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                    ? new Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+                    : new Notification.Builder(this);
+            builder.setSmallIcon(icon)
+                    .setContentTitle(getString(R.string.awg_vpn_notification_title))
+                    .setContentText(getString(notificationState.textResource))
+                    .setCategory(Notification.CATEGORY_SERVICE)
+                    .setVisibility(Notification.VISIBILITY_PUBLIC)
+                    .setOngoing(true)
+                    .setOnlyAlertOnce(true)
+                    .setShowWhen(false)
+                    .setPriority(Notification.PRIORITY_LOW);
+            final Intent launchIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+            if (launchIntent != null) {
+                final PendingIntent contentIntent = PendingIntent.getActivity(this, 0, launchIntent,
+                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                builder.setContentIntent(contentIntent);
+            }
+            return builder.build();
+        }
+
+        synchronized void updateNotification(final VpnNotificationState state) {
+            if (state == VpnNotificationState.CONNECTED && notificationState != VpnNotificationState.CONNECTING)
+                return;
+            if (destroyed)
+                return;
+            notificationState = state;
+            final Notification notification = buildNotification();
+            if (!foregroundStarted) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(NOTIFICATION_ID, notification,
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    // Before API 34, do not pass the API-34-only specialUse manifest bit.
+                    startForeground(NOTIFICATION_ID, notification, 0);
+                } else {
+                    startForeground(NOTIFICATION_ID, notification);
+                }
+                foregroundStarted = true;
+            } else {
+                final NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                if (manager != null)
+                    manager.notify(NOTIFICATION_ID, notification);
+            }
+        }
+
+        synchronized void stopForegroundAndNotification() {
+            if (foregroundStarted) {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                foregroundStarted = false;
+            }
+            final NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (manager != null)
+                manager.cancel(NOTIFICATION_ID);
+        }
+
         @Override
         public void onCreate() {
-            vpnService.complete(this);
             super.onCreate();
+            createNotificationChannel();
+            vpnService.complete(this);
         }
 
         @Override
         public void onDestroy() {
+            destroyed = true;
+            stopForegroundAndNotification();
             if (owner != null) {
+                owner.vpnServiceInstance = null;
                 final Tunnel tunnel = owner.currentTunnel;
                 if (tunnel != null) {
                     if (owner.currentTunnelHandle != -1)
@@ -521,6 +638,10 @@ public final class GoBackend implements Backend {
 
         @Override
         public int onStartCommand(@Nullable final Intent intent, final int flags, final int startId) {
+            // onCreate() completes the backend future; setOwner() may already have promoted
+            // the service before Android invokes onStartCommand(). Do not downgrade that state.
+            if (owner == null)
+                updateNotification(VpnNotificationState.STARTING);
             vpnService.complete(this);
             if (intent == null || intent.getComponent() == null || !intent.getComponent().getPackageName().equals(getPackageName())) {
                 Log.d(TAG, "Service started by Always-on VPN feature");
@@ -532,6 +653,12 @@ public final class GoBackend implements Backend {
 
         public void setOwner(final GoBackend owner) {
             this.owner = owner;
+            owner.vpnServiceInstance = this;
+            updateNotification(VpnNotificationState.CONNECTING);
+        }
+
+        void onHandshakeEstablished() {
+            updateNotification(notificationState.afterHandshake());
         }
     }
 }
